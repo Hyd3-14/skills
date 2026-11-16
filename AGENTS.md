@@ -15,6 +15,7 @@ This repository publishes Agent Skills written from real work. Conventions here 
 - A skill is generalized before it lands here: no machine names, personal paths beyond the layouts the skill itself documents, account details, or tokens. Environment-specific variants stay in the author's own dotfiles.
 - Bundled scripts are tested before they are published — at minimum a dry-run against a fixture that exercises the destructive paths safely — and the test is described in the change that adds them.
 - Nothing in this repository is published on someone else's behalf: skills adopted from other authors are credited and linked, not copied in.
+- Some skills here are generalized editions of working originals the author maintains elsewhere for daily use. The two editions are expected to differ — the original keeps its environment-specific wiring, this edition drops it. When behavior changes or a bug is fixed in one edition, port the change to the other in the same round of work; never let fixes accumulate on one side only. The original records which published skill it corresponds to.
 
 ## Routing
 
