@@ -1,0 +1,900 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	cat <<'USAGE'
+Usage: gprune-merged [--dry-run | --apply] [--no-fetch] [--all]
+
+Clean up local branches that GitHub confirms are finished.
+Merged branches are detected through their pull requests, so squash merges
+count even though git's ancestry check cannot see them. A branch whose PR
+was closed without merging is cleaned up locally only when the PR head, the
+local branch, and the origin branch all point at the same commit; its remote
+branch is never deleted. Default is --dry-run.
+
+Options:
+  --dry-run   only show the candidates (default)
+  --apply     delete the candidates that pass every safety check
+  --no-fetch  skip `git fetch --prune` (for callers that already fetched)
+  --all       dry-run across every repository listed by ghq (cannot be
+              combined with --apply)
+  -h, --help  show this help
+USAGE
+}
+
+mode="dry-run"
+fetch_first=1
+all_repositories=0
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--dry-run)
+		mode="dry-run"
+		;;
+	--apply)
+		mode="apply"
+		;;
+	--no-fetch)
+		fetch_first=0
+		;;
+	--all)
+		all_repositories=1
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		echo "gprune-merged: unknown option: $1" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+if ((all_repositories)); then
+	if [[ "$mode" != "dry-run" ]]; then
+		echo 'gprune-merged: --all is dry-run only' >&2
+		exit 2
+	fi
+	command -v ghq >/dev/null 2>&1 || { echo 'gprune-merged: --all requires ghq' >&2; exit 1; }
+	command -v git >/dev/null 2>&1 || { echo 'gprune-merged: git is required' >&2; exit 1; }
+	repositories="$(ghq list -p)" || exit 1
+	script_path="$(realpath "${BASH_SOURCE[0]}")"
+	fetch_options=()
+	((fetch_first)) || fetch_options+=(--no-fetch)
+	report_status=0
+	while IFS= read -r repository; do
+		[[ -n "$repository" ]] || continue
+		printf '\n=== %s ===\n' "$repository"
+		if [[ "$(git -C "$repository" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]]; then
+			echo '[skip] not inside a Git work tree; out of scope'
+			continue
+		fi
+		(cd "$repository" && "$script_path" --dry-run "${fetch_options[@]}") || {
+			echo "[error] $repository: failed to list candidates" >&2
+			report_status=1
+		}
+	done <<<"$repositories"
+	exit "$report_status"
+fi
+
+for command_name in git gh; do
+	if ! command -v "$command_name" >/dev/null 2>&1; then
+		echo "gprune-merged: required command not found: $command_name" >&2
+		exit 1
+	fi
+done
+
+# Worktree removal goes through gwq when it is installed (it knows the
+# branch-to-worktree mapping); otherwise plain git is used. Only clean
+# worktrees reach the removal path — dirty ones are trashed instead.
+have_gwq=0
+command -v gwq >/dev/null 2>&1 && have_gwq=1
+
+wt_remove() {
+	local branch="$1" path="$2"
+	if ((have_gwq)); then
+		echo "+ gwq remove $branch"
+		gwq remove "$branch"
+	else
+		echo "+ git worktree remove $path"
+		git worktree remove "$path"
+	fi
+}
+
+wt_remove_dry_run() {
+	local branch="$1" path="$2"
+	if ((have_gwq)); then
+		echo "+ gwq remove --dry-run $branch"
+		gwq remove --dry-run "$branch"
+	else
+		# git worktree remove has no dry-run; the snapshot rechecks in
+		# worktree_recheck are the safety net on this path.
+		echo "+ git worktree remove $path (no dry-run in git; state already rechecked)"
+	fi
+}
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	echo "gprune-merged: run inside a Git worktree" >&2
+	exit 1
+fi
+
+current_branch="$(git branch --show-current)"
+if [[ -z "$current_branch" ]]; then
+	if [[ "$mode" == "dry-run" ]]; then
+		echo '[skip] detached HEAD; this repository is out of scope'
+		exit 0
+	fi
+	echo "gprune-merged: cannot run with a detached HEAD" >&2
+	exit 1
+fi
+
+if ((fetch_first)); then
+	echo "+ git fetch --prune"
+	git fetch --prune
+fi
+
+branches=()
+while IFS= read -r branch; do
+	[[ -n "$branch" ]] || continue
+	[[ "$branch" == "$current_branch" ]] && continue
+	case "$branch" in main | master | production) continue ;; esac
+	branches+=("$branch")
+done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+
+if ((${#branches[@]} == 0)); then
+	echo "No merged branches to clean up."
+	exit 0
+fi
+
+repo_slug="${GH_REPO:-}"
+if [[ -z "$repo_slug" ]]; then
+	remote_url="$(git config --get remote.origin.url 2>/dev/null || true)"
+	case "$remote_url" in
+	git@github.com:*) repo_slug="${remote_url#git@github.com:}" ;;
+	https://github.com/*) repo_slug="${remote_url#https://github.com/}" ;;
+	ssh://git@github.com/*) repo_slug="${remote_url#ssh://git@github.com/}" ;;
+	esac
+	repo_slug="${repo_slug%.git}"
+fi
+
+if [[ "$repo_slug" != */* ]]; then
+	for branch in "${branches[@]}"; do
+		echo "[skip] $branch: cannot identify the GitHub repository" >&2
+	done
+	echo "No merged branches to clean up."
+	exit 0
+fi
+
+repo_owner="${repo_slug%%/*}"
+repo_name="${repo_slug#*/}"
+graphql_query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {'
+query_index=0
+for branch in "${branches[@]}"; do
+	escaped_branch="${branch//\\/\\\\}"
+	escaped_branch="${escaped_branch//\"/\\\"}"
+	graphql_query+=" b${query_index}: pullRequests(states: [OPEN, CLOSED, MERGED], headRefName: \"${escaped_branch}\", first: 100) { pageInfo { hasNextPage } nodes { state headRefName headRefOid mergedAt number headRepository { nameWithOwner } } }"
+	query_index=$((query_index + 1))
+done
+graphql_query+=' } }'
+
+query_pr_rows() {
+	gh api graphql \
+		-F owner="$repo_owner" \
+		-F name="$repo_name" \
+		-f query="$graphql_query" \
+		--jq 'if any(.data.repository[]?; .pageInfo.hasNextPage == true) then error("PR history exceeds the fetch limit") else .data.repository[]?.nodes[]? | [.state, .headRefName, .headRefOid, (.mergedAt // "-"), (.number // 0 | tostring), (.headRepository.nameWithOwner // "-")] | @tsv end' \
+		2>/dev/null
+}
+
+parse_pr_rows() {
+	open_branch_seen=()
+	closed_branch_seen=()
+	closed_heads=()
+	merged_branch_seen=()
+	merged_at_by_branch_oid=()
+	merged_heads_by_branch=()
+	while IFS=$'\t' read -r pr_state pr_branch pr_head_oid merged_at pr_number head_repository; do
+		[[ -n "$pr_state" && -n "$pr_branch" && -n "$pr_head_oid" ]] || continue
+		case "$pr_state" in
+		OPEN)
+			open_branch_seen["$pr_branch"]=1
+			;;
+		CLOSED)
+			closed_branch_seen["$pr_branch"]=1
+			if [[ "$head_repository" == "$repo_slug" ]]; then
+				closed_heads["$pr_branch:$pr_head_oid"]=1
+			fi
+			;;
+		MERGED)
+			[[ -n "$merged_at" ]] || continue
+			merged_branch_seen["$pr_branch"]=1
+			merged_at_by_branch_oid["$pr_branch:$pr_head_oid"]="$merged_at"
+			merged_heads_by_branch["$pr_branch"]+="$pr_head_oid ${pr_number:-}"$'\n'
+			;;
+		esac
+	done <<<"$1"
+}
+
+# Return a merged PR head that contains the local branch. An exact SHA match
+# wins; otherwise check ancestry. After a squash merge, later commits may
+# exist only on the PR branch — then the local branch is an ancestor of the
+# PR head and holds no commits of its own, so it is safe to delete.
+# Returns: 0 = found (head OID on stdout), 1 = the local branch has commits
+# the PR head does not contain, 2 = a PR head commit could not be fetched.
+resolve_merged_head() {
+	local branch="$1"
+	local local_oid="$2"
+	local head_oid
+	local pr_number
+	local missing=0
+
+	if [[ -n "${merged_at_by_branch_oid[$branch:$local_oid]+x}" ]]; then
+		echo "$local_oid"
+		return 0
+	fi
+	while read -r head_oid pr_number; do
+		[[ -n "$head_oid" ]] || continue
+		if ! git cat-file -e "$head_oid^{commit}" 2>/dev/null; then
+			# Even after the remote branch is deleted, the PR head can be
+			# fetched as refs/pull/<n>/head. Fetch without creating a ref.
+			[[ "$pr_number" =~ ^[0-9]+$ ]] &&
+				git fetch --quiet --no-tags origin "refs/pull/$pr_number/head" >/dev/null 2>&1 || true
+		fi
+		if ! git cat-file -e "$head_oid^{commit}" 2>/dev/null; then
+			missing=1
+			continue
+		fi
+		if git merge-base --is-ancestor "$local_oid" "$head_oid"; then
+			echo "$head_oid"
+			return 0
+		fi
+	done <<<"${merged_heads_by_branch[$branch]-}"
+	((missing)) && return 2
+	return 1
+}
+
+if ! pr_rows="$(query_pr_rows)"; then
+	for branch in "${branches[@]}"; do
+		echo "[skip] $branch: cannot check the corresponding PRs" >&2
+	done
+	echo "No merged branches to clean up."
+	exit 0
+fi
+
+declare -A open_branch_seen=()
+declare -A closed_branch_seen=()
+declare -A closed_heads=()
+declare -A merged_branch_seen=()
+declare -A merged_at_by_branch_oid=()
+declare -A merged_heads_by_branch=()
+parse_pr_rows "$pr_rows"
+
+declare -A current_worktree_path_by_branch=()
+load_worktree_paths() {
+	current_worktree_path_by_branch=()
+	local worktree_path=""
+	local worktree_branch
+	local line
+	while IFS= read -r line; do
+		case "$line" in
+		"worktree "*)
+			worktree_path="${line#worktree }"
+			;;
+		"branch refs/heads/"*)
+			worktree_branch="${line#branch refs/heads/}"
+			current_worktree_path_by_branch["$worktree_branch"]="$worktree_path"
+			;;
+		"")
+			worktree_path=""
+			;;
+		esac
+	done < <(git worktree list --porcelain)
+}
+
+load_worktree_paths
+declare -A worktree_path_by_branch=()
+for worktree_branch in "${!current_worktree_path_by_branch[@]}"; do
+	worktree_path_by_branch["$worktree_branch"]="${current_worktree_path_by_branch[$worktree_branch]}"
+done
+
+read_cwds_individually() {
+	local cwd_link process_cwd
+	for cwd_link in "$@"; do
+		process_cwd="$(readlink "$cwd_link" 2>/dev/null)" || continue
+		printf '%s\0' "$process_cwd"
+	done
+}
+
+process_cwds() {
+	if command -v python3 >/dev/null 2>&1; then
+		python3 -c '
+import glob, os, sys
+for path in glob.iglob("/proc/[0-9]*/cwd"):
+    try:
+        cwd = os.readlink(path)
+    except OSError:
+        continue
+    sys.stdout.buffer.write(os.fsencode(cwd) + b"\0")
+' && return
+	fi
+	read_cwds_individually /proc/[0-9]*/cwd
+}
+
+# Scan /proc once for all worktrees, not once per worktree.
+declare -A busy_worktree_by_branch=()
+if ((${#worktree_path_by_branch[@]} > 0)); then
+	while IFS= read -r -d '' process_cwd; do
+		for worktree_branch in "${!worktree_path_by_branch[@]}"; do
+			worktree_path="${worktree_path_by_branch[$worktree_branch]}"
+			if [[ "$process_cwd" == "$worktree_path" ||
+				"$process_cwd" == "$worktree_path/"* ]]; then
+				busy_worktree_by_branch["$worktree_branch"]=1
+			fi
+		done
+	done < <(process_cwds)
+fi
+
+# A worktree with uncommitted changes or ignored files is still cleaned up,
+# but nothing is lost: regenerable files are deleted and the rest is moved
+# to .trash. The state seen at candidate collection is remembered, and if it
+# changed by deletion time, someone is working there — abort that branch.
+declare -A worktree_status_by_branch=()
+# Moving the main worktree (the one holding the repository's .git) would
+# break every other worktree, so it is never trashed.
+# Do not let awk exit early on the first match: a git process still writing
+# into the pipe would die with SIGPIPE and, under pipefail, abort the whole
+# script with status 141.
+main_worktree_path="$(git worktree list --porcelain | awk '$1 == "worktree" && !found++ { print substr($0, 10) }')"
+
+worktree_files_recheck() {
+	local branch="$1"
+	local path="$2"
+	local status
+	if ! status="$(git -C "$path" status --porcelain --untracked-files=all --ignored=matching 2>/dev/null)"; then
+		echo "[skip] $branch: cannot check the worktree state" >&2
+		return 1
+	fi
+	if [[ -z "${worktree_status_by_branch[$branch]+x}" ]]; then
+		if [[ -n "$status" && "$path" == "$main_worktree_path" ]]; then
+			echo "[skip] $branch: the main worktree has uncommitted changes or ignored files (the main worktree is never trashed)" >&2
+			return 1
+		fi
+		worktree_status_by_branch["$branch"]="$status"
+		if [[ -n "$status" ]]; then
+			echo "[info] $branch: uncommitted changes or ignored files present; regenerable files will be deleted and the rest moved to .trash" >&2
+		fi
+		return 0
+	fi
+	if [[ "$status" != "${worktree_status_by_branch[$branch]}" ]]; then
+		echo "[skip] $branch: worktree contents changed after candidate collection" >&2
+		return 1
+	fi
+	return 0
+}
+
+trash_root="${GPRUNE_TRASH_ROOT:-$HOME/agent-tmp/.trash}"
+# Regenerable directories deleted before trashing. Add per-repository
+# entries with: git config --add gprune.disposable <name>
+disposable_names=(node_modules dist build .venv target .next .turbo coverage __pycache__ .pytest_cache)
+
+# Delete the regenerable files; if anything remains, move the worktree to
+# .trash. If nothing remains, return 1 and let the normal removal path run.
+trash_worktree() {
+	local branch="$1"
+	local path="$2"
+	local -a names=("${disposable_names[@]}")
+	local extra line dir gitdir
+	while IFS= read -r extra; do
+		[[ -n "$extra" ]] && names+=("$extra")
+	done < <(git config --get-all gprune.disposable 2>/dev/null || true)
+	# Delete only directories that are ignored as a whole and match a
+	# disposable name. Ignored files inside tracked directories and ignored
+	# files whose names do not match (e.g. .env.local) are not deleted;
+	# they go to .trash with everything else.
+	while IFS= read -r -d '' line; do
+		[[ "$line" == */ ]] || continue
+		dir="${line%/}"
+		for extra in "${names[@]}"; do
+			if [[ "${dir##*/}" == "$extra" ]]; then
+				echo "+ rm -rf $path/$dir"
+				rm -rf -- "${path:?}/$dir"
+				break
+			fi
+		done
+	done < <(git -C "$path" ls-files -z --others --ignored --exclude-standard --directory)
+	if [[ -z "$(git -C "$path" status --porcelain --untracked-files=all --ignored=matching)" ]]; then
+		return 1
+	fi
+	gitdir="$(git -C "$path" rev-parse --absolute-git-dir)"
+	if [[ "$gitdir" != */worktrees/* ]]; then
+		echo "[error] $branch: $path is not a linked worktree; not moving it to .trash" >&2
+		exit 1
+	fi
+	local rel="${path#"$HOME"/}"
+	rel="${rel#/}"
+	local dest
+	dest="$trash_root/$(date +%Y%m%d)/worktrees/$rel"
+	while [[ -e "$dest" ]]; do
+		dest="$dest.again"
+	done
+	mkdir -p "$(dirname "$dest")"
+	echo "+ mv $path $dest"
+	mv -- "$path" "$dest"
+	# Do not run a repository-wide `git worktree prune`: it would also drop
+	# registrations for worktrees on unmounted external drives.
+	echo "+ rm -rf $gitdir"
+	rm -rf -- "${gitdir:?}"
+	echo "[trash] $branch: $dest (recover the contents from here; the worktree registration and the branch are removed)"
+	return 0
+}
+
+worktree_recheck() {
+	local branch="$1"
+	local path="$2"
+	local process_cwd
+
+	if [[ ! -d "$path" ]]; then
+		echo "[skip] $branch: the worktree no longer exists" >&2
+		return 1
+	fi
+
+	while IFS= read -r -d '' process_cwd; do
+		if [[ "$process_cwd" == "$path" || "$process_cwd" == "$path/"* ]]; then
+			echo "[skip] $branch: a process is using the worktree" >&2
+			return 1
+		fi
+	done < <(process_cwds)
+
+	worktree_files_recheck "$branch" "$path"
+}
+
+# Optional mise integration: tools like `mise run` auto-trust the active
+# config, and the trust entry survives the worktree. Once the path is gone,
+# `mise trust --untrust` can no longer be used, so untrust just before
+# removal. A failure here does not stop the removal; leftover entries can
+# be reviewed with `mise prune --configs`.
+untrust_mise_worktree() {
+	local path="$1"
+
+	command -v mise >/dev/null 2>&1 || return 0
+	echo "+ mise trust --untrust $path"
+	if ! mise trust --quiet --untrust "$path" </dev/null; then
+		echo "[warn] $path: could not untrust in mise (see: mise prune --configs)" >&2
+	fi
+}
+
+declare -A remote_heads_status=()
+declare -A remote_head_oid_by_key=()
+
+# List each remote's heads once, and judge by the OID actually on the
+# remote, not by the local tracking ref.
+load_remote_heads() {
+	local remote="$1"
+	local rows
+	local oid
+	local ref
+
+	if [[ -n "${remote_heads_status[$remote]+x}" ]]; then
+		return "${remote_heads_status[$remote]}"
+	fi
+	if ! rows="$(git ls-remote --heads "$remote" 2>/dev/null)"; then
+		remote_heads_status["$remote"]=1
+		return 1
+	fi
+	while IFS=$'\t' read -r oid ref; do
+		[[ -n "$oid" && "$ref" == refs/heads/* ]] || continue
+		remote_head_oid_by_key["$remote:${ref#refs/heads/}"]="$oid"
+	done <<<"$rows"
+	remote_heads_status["$remote"]=0
+}
+
+# A worktree without a branch cannot be matched to a PR; report it only.
+detached_worktree_path=""
+while IFS= read -r line; do
+	case "$line" in
+	"worktree "*) detached_worktree_path="${line#worktree }" ;;
+	detached) echo "[info] detached worktree (no branch; out of scope): $detached_worktree_path" >&2 ;;
+	esac
+done < <(git worktree list --porcelain)
+
+candidate_count=0
+candidate_branches=()
+worktree_branches=()
+declare -A remote_branches_by_remote=()
+declare -A local_oid_by_branch=()
+declare -A merged_head_by_branch=()
+declare -A remote_oid_by_key=()
+declare -A closed_candidates=()
+declare -A retained_remote_keys=()
+declare -A checked_remote_branches_by_remote=()
+
+for branch in "${branches[@]}"; do
+	if [[ -n "${open_branch_seen[$branch]+x}" ]]; then
+		echo "[skip] $branch: has an open PR" >&2
+		continue
+	fi
+
+	local_oid="$(git rev-parse "refs/heads/$branch")"
+	is_closed=0
+	if [[ -z "${merged_branch_seen[$branch]+x}" ]]; then
+		if [[ -z "${closed_branch_seen[$branch]+x}" ]]; then
+			echo "[skip] $branch: no corresponding PR" >&2
+			continue
+		fi
+		if [[ -z "${closed_heads[$branch:$local_oid]+x}" ]]; then
+			echo "[skip] $branch: the closed PR's head SHA or repository does not match" >&2
+			continue
+		fi
+		is_closed=1
+	fi
+
+	if ((is_closed)); then
+		merged_head="$local_oid"
+		resolve_status=0
+	elif merged_head="$(resolve_merged_head "$branch" "$local_oid")"; then
+		resolve_status=0
+	else
+		resolve_status=$?
+	fi
+	case "$resolve_status" in
+	1)
+		echo "[skip] $branch: local commits are not contained in the merged PR head" >&2
+		continue
+		;;
+	2)
+		echo "[skip] $branch: cannot fetch the merged PR head commit, so containment cannot be verified" >&2
+		continue
+		;;
+	esac
+	merged_at="${merged_at_by_branch_oid[$branch:$merged_head]-closed without merging}"
+
+	worktree_path="${worktree_path_by_branch[$branch]-}"
+	if [[ -n "$worktree_path" ]]; then
+		if [[ -n "${busy_worktree_by_branch[$branch]+x}" ]]; then
+			echo "[skip] $branch: a process is using the worktree" >&2
+			continue
+		fi
+		worktree_files_recheck "$branch" "$worktree_path" || continue
+	fi
+
+	upstream="$(git for-each-ref --format='%(upstream:short)' "refs/heads/$branch")"
+	upstream_remote="$(git for-each-ref --format='%(upstream:remotename)' "refs/heads/$branch")"
+	remote_branch=""
+	remote_state="none"
+	if [[ -n "$upstream" && -n "$upstream_remote" ]]; then
+		remote_branch="${upstream#"$upstream_remote/"}"
+		remote_key="$upstream_remote:$remote_branch"
+		if ! git show-ref --verify --quiet "refs/remotes/$upstream_remote/$remote_branch"; then
+			remote_state="gone"
+		elif [[ "$remote_branch" != "$branch" ]]; then
+			# The upstream points at a different branch than the PR's
+			# (e.g. a shared branch); never delete it.
+			remote_state="name-mismatch"
+		elif ! load_remote_heads "$upstream_remote"; then
+			echo "[skip] $branch: cannot verify the remote branch OID" >&2
+			continue
+		elif [[ -z "${remote_head_oid_by_key[$remote_key]+x}" ]]; then
+			remote_state="gone"
+		elif [[ "${remote_head_oid_by_key[$remote_key]}" != "$local_oid" &&
+			"${remote_head_oid_by_key[$remote_key]}" != "$merged_head" ]]; then
+			# Commits may have been pushed to the remote after the merge;
+			# delete only when it still points at the PR head.
+			remote_state="diverged"
+		else
+			remote_state="exists"
+		fi
+	fi
+
+	if ((is_closed)); then
+		if [[ "$upstream_remote" != "origin" || "$remote_state" != "exists" ]]; then
+			echo "[skip] $branch: cannot confirm an origin branch at the same SHA as the closed PR" >&2
+			continue
+		fi
+		closed_candidates["$branch"]=1
+		retained_remote_keys["$remote_key"]=1
+	fi
+
+	candidate_count=$((candidate_count + 1))
+	candidate_branches+=("$branch")
+	local_oid_by_branch["$branch"]="$local_oid"
+	merged_head_by_branch["$branch"]="$merged_head"
+	if [[ -n "$worktree_path" ]]; then
+		worktree_branches+=("$branch")
+	fi
+	if [[ "$remote_state" == "exists" ]]; then
+		checked_remote_branches_by_remote["$upstream_remote"]+="$remote_branch"$'\n'
+		if ! ((is_closed)); then
+			remote_branches_by_remote["$upstream_remote"]+="$remote_branch"$'\n'
+		fi
+		remote_oid_by_key["$remote_key"]="${remote_head_oid_by_key[$remote_key]}"
+	fi
+
+	echo "[candidate] $branch (merged: $merged_at)"
+	if [[ "$merged_head" != "$local_oid" ]]; then
+		echo "  local: ancestor of the merged PR head (later commits exist only on the PR side)"
+	fi
+	if [[ -n "$worktree_path" ]]; then
+		echo "  worktree: $worktree_path"
+	else
+		echo "  worktree: none"
+	fi
+	case "$remote_state" in
+	exists)
+		if ((is_closed)); then
+			echo "  remote: $upstream (kept: the PR was not merged)"
+		else
+			echo "  remote: $upstream"
+		fi
+		;;
+	gone) echo "  remote: $upstream (gone)" ;;
+	name-mismatch) echo "  remote: $upstream (name differs from the PR branch; not deleted)" ;;
+	diverged) echo "  remote: $upstream (points at a commit other than the PR head; not deleted)" ;;
+	*) echo "  remote: no upstream" ;;
+	esac
+done
+
+if ((candidate_count == 0)); then
+	echo "No merged branches to clean up."
+	exit 0
+fi
+
+declare -A worktree_removed_by_branch=()
+
+worktree_registration_matches_snapshot() {
+	local branch
+	local expected_path
+	local current_path
+
+	load_worktree_paths
+	for branch in "${candidate_branches[@]}"; do
+		expected_path="${worktree_path_by_branch[$branch]-}"
+		if [[ -n "${worktree_removed_by_branch[$branch]+x}" ]]; then
+			expected_path=""
+		fi
+		current_path="${current_worktree_path_by_branch[$branch]-}"
+		if [[ "$current_path" != "$expected_path" ]]; then
+			echo "[skip] $branch: worktree registration changed after candidate collection" >&2
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+candidate_pr_state_matches_snapshot() {
+	local latest_pr_rows
+	local branch
+	local branch_oid_key
+
+	if ! latest_pr_rows="$(query_pr_rows)"; then
+		echo "[skip] cannot re-verify the PR state before deletion" >&2
+		return 1
+	fi
+	parse_pr_rows "$latest_pr_rows"
+	for branch in "${candidate_branches[@]}"; do
+		if [[ -n "${open_branch_seen[$branch]+x}" ]]; then
+			echo "[skip] $branch: became an open PR after candidate collection" >&2
+			return 1
+		fi
+		if [[ -n "${closed_candidates[$branch]+x}" ]]; then
+			if [[ -z "${closed_heads[$branch:${local_oid_by_branch[$branch]}]+x}" ]]; then
+				echo "[skip] $branch: the closed PR's state or head SHA changed after candidate collection" >&2
+				return 1
+			fi
+			continue
+		fi
+		# Containment of the local OID was verified at collection time; here
+		# only check that the same PR head is still merged.
+		branch_oid_key="$branch:${merged_head_by_branch[$branch]}"
+		if [[ -z "${merged_at_by_branch_oid[$branch_oid_key]+x}" ]]; then
+			echo "[skip] $branch: the merged PR's head SHA changed after candidate collection" >&2
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+candidate_local_refs_match_snapshot() {
+	local branch
+	local expected_oid
+	local current_oid
+
+	for branch in "${candidate_branches[@]}"; do
+		expected_oid="${local_oid_by_branch[$branch]}"
+		if ! current_oid="$(git rev-parse "refs/heads/$branch" 2>/dev/null)" ||
+			[[ "$current_oid" != "$expected_oid" ]]; then
+			echo "[skip] $branch: local branch OID changed after candidate collection" >&2
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+# Verify on the remote that the branches about to be deleted still point
+# where they pointed at candidate collection.
+candidate_remote_refs_match_snapshot() {
+	local phase="${1:-all}"
+	local upstream_remote
+	local remote_branch
+	local remote_key
+	local remote_rows
+	local remote_oid
+	local remote_ref
+	local expected_oid
+	local -a remote_refs
+	local -A remote_oid_by_ref
+
+	for upstream_remote in "${!checked_remote_branches_by_remote[@]}"; do
+		remote_refs=()
+		remote_oid_by_ref=()
+		while IFS= read -r remote_branch; do
+			[[ -n "$remote_branch" ]] || continue
+			if [[ "$phase" == "retained" && -z "${retained_remote_keys[$upstream_remote:$remote_branch]+x}" ]]; then
+				continue
+			fi
+			remote_refs+=("refs/heads/$remote_branch")
+		done <<<"${checked_remote_branches_by_remote[$upstream_remote]}"
+		((${#remote_refs[@]} > 0)) || continue
+
+		if ! remote_rows="$(git ls-remote "$upstream_remote" "${remote_refs[@]}" 2>/dev/null)"; then
+			echo "[skip] $upstream_remote: cannot verify the remote branch OIDs" >&2
+			return 1
+		fi
+		while IFS=$'\t' read -r remote_oid remote_ref; do
+			[[ -n "$remote_oid" && -n "$remote_ref" ]] || continue
+			remote_oid_by_ref["$remote_ref"]="$remote_oid"
+		done <<<"$remote_rows"
+		while IFS= read -r remote_branch; do
+			[[ -n "$remote_branch" ]] || continue
+			remote_key="$upstream_remote:$remote_branch"
+			if [[ "$phase" == "retained" && -z "${retained_remote_keys[$remote_key]+x}" ]]; then
+				continue
+			fi
+			expected_oid="${remote_oid_by_key[$remote_key]}"
+			remote_ref="refs/heads/$remote_branch"
+			remote_oid="${remote_oid_by_ref[$remote_ref]-}"
+			if [[ "$remote_oid" != "$expected_oid" ]]; then
+				echo "[skip] $remote_key: remote branch OID changed after candidate collection" >&2
+				return 1
+			fi
+		done <<<"${checked_remote_branches_by_remote[$upstream_remote]}"
+	done
+
+	return 0
+}
+
+destructive_state_matches_snapshot() {
+	candidate_pr_state_matches_snapshot || return 1
+	worktree_registration_matches_snapshot || return 1
+	candidate_local_refs_match_snapshot || return 1
+	candidate_remote_refs_match_snapshot || return 1
+	return 0
+}
+
+local_delete_state_matches_snapshot() {
+	candidate_pr_state_matches_snapshot || return 1
+	worktree_registration_matches_snapshot || return 1
+	candidate_local_refs_match_snapshot || return 1
+	candidate_remote_refs_match_snapshot retained || return 1
+	return 0
+}
+
+if [[ "$mode" == "dry-run" ]]; then
+	echo "To apply: gprune-merged --apply"
+	exit 0
+fi
+
+# Worktree removal stays serial to avoid Git metadata contention.
+# If any state changed after candidate collection, do not proceed to the
+# batched branch deletions.
+destructive_phase_aborted=0
+if ! destructive_state_matches_snapshot; then
+	destructive_phase_aborted=1
+fi
+for branch in "${worktree_branches[@]}"; do
+	((destructive_phase_aborted)) && break
+	worktree_path="${worktree_path_by_branch[$branch]}"
+	if ! worktree_recheck "$branch" "$worktree_path"; then
+		destructive_phase_aborted=1
+		break
+	fi
+	wt_remove_dry_run "$branch" "$worktree_path"
+	if ! worktree_recheck "$branch" "$worktree_path"; then
+		destructive_phase_aborted=1
+		break
+	fi
+	if [[ -n "${closed_candidates[$branch]+x}" ]] && ! destructive_state_matches_snapshot; then
+		destructive_phase_aborted=1
+		break
+	fi
+	untrust_mise_worktree "$worktree_path"
+	if [[ -z "${worktree_status_by_branch[$branch]-}" ]] || ! trash_worktree "$branch" "$worktree_path"; then
+		wt_remove "$branch" "$worktree_path"
+	fi
+	worktree_removed_by_branch["$branch"]=1
+done
+
+if ! ((destructive_phase_aborted)); then
+	if ! destructive_state_matches_snapshot; then
+		destructive_phase_aborted=1
+	fi
+fi
+
+if ((destructive_phase_aborted)); then
+	echo "Destructive phase aborted. Re-check the state and run again." >&2
+	exit 1
+fi
+
+# Delete remote branches in one push per remote to cut connection and auth
+# round trips. If one branch is rejected the others still go; a branch that
+# remains on the remote keeps its local branch too.
+declare -A remote_delete_failed_by_branch=()
+for upstream_remote in "${!remote_branches_by_remote[@]}"; do
+	remote_branches=()
+	remote_push_leases=()
+	remote_refspecs=()
+	remote_refs=()
+	while IFS= read -r remote_branch; do
+		[[ -n "$remote_branch" ]] || continue
+		remote_key="$upstream_remote:$remote_branch"
+		remote_branches+=("$remote_branch")
+		remote_push_leases+=("--force-with-lease=refs/heads/$remote_branch:${remote_oid_by_key[$remote_key]}")
+		remote_refspecs+=(":refs/heads/$remote_branch")
+		remote_refs+=("refs/heads/$remote_branch")
+	done <<<"${remote_branches_by_remote[$upstream_remote]}"
+	((${#remote_branches[@]} > 0)) || continue
+	echo "+ git push ${remote_push_leases[*]} -- $upstream_remote ${remote_refspecs[*]}"
+	if ! git push "${remote_push_leases[@]}" -- "$upstream_remote" "${remote_refspecs[@]}"; then
+		echo "[warn] $upstream_remote: some remote branches could not be deleted" >&2
+	fi
+	if ! remaining_rows="$(git ls-remote "$upstream_remote" "${remote_refs[@]}" 2>/dev/null)"; then
+		echo "[warn] $upstream_remote: cannot verify the deletion result; keeping the matching local branches" >&2
+		for remote_branch in "${remote_branches[@]}"; do
+			remote_delete_failed_by_branch["$remote_branch"]=1
+		done
+		continue
+	fi
+	for remote_branch in "${remote_branches[@]}"; do
+		if grep -Fq -- $'\t'"refs/heads/$remote_branch" <<<"$remaining_rows"; then
+			remote_delete_failed_by_branch["$remote_branch"]=1
+		fi
+	done
+done
+
+local_delete_branches=()
+for branch in "${candidate_branches[@]}"; do
+	if [[ -n "${remote_delete_failed_by_branch[$branch]+x}" ]]; then
+		echo "[skip] $branch: the remote branch could not be deleted, so the local branch is kept" >&2
+		continue
+	fi
+	local_delete_branches+=("$branch")
+done
+
+if ((${#local_delete_branches[@]} > 0)); then
+	if ! local_delete_state_matches_snapshot; then
+		echo "Destructive phase aborted. Re-check the state and run again." >&2
+		exit 1
+	fi
+	# Squash merges break git's ancestry check, so force-delete is used —
+	# but only for candidates whose merge state and PR head SHA were
+	# verified against GitHub. Branches checked out, rebased, or bisected
+	# are refused by git itself and simply remain.
+	echo "+ git branch -D -- ${local_delete_branches[*]}"
+	if ! git branch -D -- "${local_delete_branches[@]}"; then
+		echo "[warn] some local branches could not be deleted" >&2
+	fi
+fi
+
+deleted_count=0
+for branch in "${candidate_branches[@]}"; do
+	if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+		deleted_count=$((deleted_count + 1))
+	fi
+done
+
+echo "Deleted $deleted_count branch(es)."
