@@ -1,5 +1,7 @@
 # skills
 
+English | [日本語](README.ja.md)
+
 Agent Skills I wrote from real work, published as open source.
 
 Each skill lives in `skills/<name>/SKILL.md` and follows the [Agent Skills](https://agentskills.io) format, so it works across Claude Code, Codex, GitHub Copilot, and other compatible agents.
