@@ -11,6 +11,7 @@
 | スキル | 内容 |
 | --- | --- |
 | [github-issue-artifacts](skills/github-issue-artifacts/SKILL.md) | GitHub Issue の HTML アーティファクト（`embedded_html`）を、サンドボックス化されたプレビューで実際に描画される形で作り、更新する。SVG 埋め込みのアイコン、CSS のみのテーマ切り替え、コントラスト比を確認したライトとダークの色の組、細いプレビューペインでも読める表、API での読み戻し検証が中身。GitHub 公式の `issue-artifacts` スキルが担うのは API アクセスの基本で、このスキルは公式が触れていない HTML の作り方側を担う |
+| [temp-workspace-hygiene](skills/temp-workspace-hygiene/SKILL.md) | エージェントの一時作業を、追跡できないまま溜め込まないための規律。捨てる作業ファイル（`~/agent-tmp`）と人間が確認する成果物（`~/artifacts`）の置き場所を分け、作ったもの全てに所有者・用途・保持期限を manifest で記録し、作業の終わりに安全に棚卸しする。保持期限切れと放置分は `.trash` へ移して7日後に消す2段ライフサイクルで、整理スクリプト付き |
 
 ## 導入
 
