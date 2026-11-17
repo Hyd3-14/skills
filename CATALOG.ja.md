@@ -51,3 +51,9 @@ Pull Request が merge 済みのローカルブランチを、squash merge 込�
 **前提.** `git` とログイン済みの `gh`。任意で、worktree 削除を任せる `gwq`（なければ素の `git worktree remove`）、リポジトリ横断の `--all` 用の `ghq`、trust 整理の `mise`。
 
 → [skills/prune-merged-branches/SKILL.md](skills/prune-merged-branches/SKILL.md)
+
+---
+
+## 関連プロジェクト
+
+- [muse-widgets](https://github.com/Hyd3-14/muse-widgets) — Muse のチャット内ウィジェットのための部品カタログ、雛形、検査ツールと、Skill `chat-intelligent-ui` のリポジトリ。Skill はカタログと一緒に育てるため、こちらには複製を持たずリンクだけを置く。

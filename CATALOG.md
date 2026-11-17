@@ -51,3 +51,9 @@ Delete local branches whose pull requests are merged — squash merges included 
 **Requirements.** `git` and an authenticated `gh`. Optional: `gwq` for worktree removal (plain `git worktree remove` otherwise), `ghq` for the cross-repository `--all` sweep, `mise` for trust cleanup.
 
 → [skills/prune-merged-branches/SKILL.md](skills/prune-merged-branches/SKILL.md)
+
+---
+
+## Related projects
+
+- [muse-widgets](https://github.com/Hyd3-14/muse-widgets) — a component catalog, templates, a validator, and the `chat-intelligent-ui` skill for interactive chat widgets in Muse. The skill lives in that repository, not here, so the catalog and the skill can evolve together.
