@@ -15,6 +15,7 @@
 | [github-issue-artifacts](skills/github-issue-artifacts/SKILL.md) | GitHub Issue の HTML アーティファクト（`embedded_html`）を、サンドボックス化されたプレビューで実際に描画される形で作り、更新する。SVG 埋め込みのアイコン、CSS のみのテーマ切り替え、コントラスト比を確認したライトとダークの色の組、細いプレビューペインでも読める表、API での読み戻し検証が中身。GitHub 公式の `issue-artifacts` スキルが担うのは API アクセスの基本で、このスキルは公式が触れていない HTML の作り方側を担う |
 | [temp-workspace-hygiene](skills/temp-workspace-hygiene/SKILL.md) | エージェントの一時作業を、追跡できないまま溜め込まないための規律。捨てる作業ファイル（`~/agent-tmp`）と人間が確認する成果物（`~/artifacts`）の置き場所を分け、作ったもの全てに所有者・用途・保持期限を manifest で記録し、作業の終わりに安全に棚卸しする。保持期限切れと放置分は `.trash` へ移して7日後に消す2段ライフサイクルで、整理スクリプト付き |
 | [prune-merged-branches](skills/prune-merged-branches/SKILL.md) | GitHub の PR が merge 済みのローカルブランチを、worktree とリモートブランチごと片付ける。`git branch --merged` では検出できない squash merge も対象。dirty な worktree は消さずに agent-tmp の `.trash` へ移し、未 merge で close された PR は厳格な条件でローカルだけを片付ける。破壊的な操作の直前には状態のスナップショットを取り直して照合する。既定は dry-run |
+| [write-readme](skills/write-readme/SKILL.md) | プロジェクトの README を、リポジトリで確認した事実だけから作り、更新する。manifest、入口と公開範囲、文書、テストを先に読み、プロジェクトの種別（CLI ツール、ライブラリ、Web アプリ、Skill 集、リポジトリテンプレート）を判定する。見出しは中央寄せで、バッジは確認できたものだけを付け、節は種別ごとの順序で並べ、書いた Quick Start を実行してから完了にする。書く内容のない節は埋めずに省き、2言語で維持する README は同じ変更で両方をそろえる |
 
 ## 導入
 

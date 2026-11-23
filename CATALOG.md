@@ -54,6 +54,22 @@ Delete local branches whose pull requests are merged — squash merges included 
 
 ---
 
+## write-readme
+
+Write a README a new reader can trust, built from what the repository actually does instead of from a template filled in by guesswork.
+
+**The problem.** A README written from a generic template keeps sections nobody maintains, such as a Roadmap or a Contact block copied from the template, and states things the code never promised. An agent asked to write one from memory does worse. It invents install commands, documents flags that do not exist, and adds badges that point at workflows the repository does not have. The reader finds out by following the instructions and watching them fail.
+
+**What it does.** A procedure with a fixed shape. Read first (the manifest, the entry points and public surface, the existing docs, `CONTRIBUTING.md`, `LICENSE`, the CI configuration, the examples, and the tests), then classify the project as a CLI tool, a library, a web app or service, an Agent Skill collection, a repository template, or other, because each type has its own section order and its own first success. The header is centered, with a one-line description, at most four badges, and a centered language switch when the repository is bilingual. Every badge must be verified against the repository, so a CI badge names a workflow file that exists and a license badge matches the `LICENSE` file. Sections with nothing true to say are omitted, Contributing links to `CONTRIBUTING.md` instead of copying it, and a bilingual repository updates both READMEs in the same change.
+
+**When to use it.** When a project has no README, when a README has drifted from the code, or before publishing a repository.
+
+**Requirements.** None for the procedure itself. Running the verification step needs the project's own toolchain, and only for the Quick Start commands the README documents.
+
+→ [skills/write-readme/SKILL.md](skills/write-readme/SKILL.md)
+
+---
+
 ## Related projects
 
 - [muse-widgets](https://github.com/Hyd3-14/muse-widgets) — a component catalog, templates, a validator, and the `chat-intelligent-ui` skill for interactive chat widgets in Muse. The skill lives in that repository, not here, so the catalog and the skill can evolve together.
